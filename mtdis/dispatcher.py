@@ -1,19 +1,16 @@
-#!/usr/bin/env python3
-"""mac-task-dispatcher: run queued shell tasks in tmux, in parallel, only while
-the Mac's conditions (network, power, GPU, free CPU and RAM) allow it.
+"""Core of mtdis: queue and state files, system checks, starting and stopping
+tasks in tmux, and the dispatch pass that Hammerspoon triggers.
 
-Hammerspoon calls `dispatcher.py run` on system events and on a timer. Each run:
-  1. records tasks that finished since the last run (done / failed),
+A dispatch pass:
+  1. records tasks that finished since the last pass (done / failed),
   2. stops tasks whose network or power requirements no longer hold,
   3. stops the newest tasks if free RAM falls below the safety reserve,
   4. starts pending tasks while their requirements fit in the remaining headroom.
 """
 
-import argparse
 import fcntl
 import json
 import os
-import re
 import shlex
 import socket
 import subprocess
@@ -24,15 +21,16 @@ from datetime import datetime
 
 import psutil
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-QUEUE_FILE = os.path.abspath(os.environ.get("MTD_QUEUE", os.path.join(BASE_DIR, "queue.json")))
-STATE_DIR = os.path.abspath(os.environ.get("MTD_STATE_DIR", os.path.join(BASE_DIR, "state")))
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.environ.get("MTDIS_CONFIG_DIR", os.path.join(HOME, ".config", "mtdis"))
+QUEUE_FILE = os.path.abspath(os.environ.get("MTDIS_QUEUE", os.path.join(CONFIG_DIR, "queue.json")))
+STATE_DIR = os.path.abspath(os.environ.get("MTDIS_STATE_DIR", os.path.join(HOME, ".local", "state", "mtdis")))
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOCK_FILE = os.path.join(STATE_DIR, ".lock")
 LOG_DIR = os.path.join(STATE_DIR, "logs")
 RUN_DIR = os.path.join(STATE_DIR, "run")
 DISPATCH_LOG = os.path.join(STATE_DIR, "dispatcher.log")
-SESSION_PREFIX = "mtd_"
+SESSION_PREFIX = "mtdis_"
 GB = 1024 ** 3
 
 # Hammerspoon starts processes with a minimal PATH; make Homebrew tools (tmux) findable.
@@ -49,7 +47,9 @@ DEFAULT_SETTINGS = {
     "terminal_app": "Terminal",  # app opened for tasks with "open_terminal": true
 }
 
-TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+class QueueError(Exception):
+    pass
 
 
 # ---------------------------------------------------------------- helpers
@@ -69,25 +69,49 @@ def fmt_time(ts):
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "-"
 
 
-def load_queue():
+def valid_task_id(task_id):
+    return bool(task_id) and all(c.isascii() and (c.isalnum() or c in "_-") for c in task_id)
+
+
+def read_queue():
+    """The queue file as stored: {"settings": {...}, "tasks": [...]}. Created empty if missing."""
     if not os.path.exists(QUEUE_FILE):
-        sys.exit(f"No queue file at {QUEUE_FILE}. Copy queue.example.json to queue.json to start.")
+        write_queue({"settings": {}, "tasks": []})
     with open(QUEUE_FILE) as f:
-        data = json.load(f)
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise QueueError(f"{QUEUE_FILE} is not valid JSON: {e}")
     if isinstance(data, list):  # a bare list of tasks is also accepted
         data = {"tasks": data}
-    settings = {**DEFAULT_SETTINGS, **data.get("settings", {})}
-    tasks = data.get("tasks", [])
+    data.setdefault("settings", {})
+    data.setdefault("tasks", [])
+    return data
+
+
+def write_queue(data):
+    os.makedirs(os.path.dirname(QUEUE_FILE), exist_ok=True)
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, QUEUE_FILE)
+
+
+def load_queue():
+    """Validated (settings, tasks) for dispatching."""
+    data = read_queue()
+    settings = {**DEFAULT_SETTINGS, **data["settings"]}
     seen = set()
-    for task in tasks:
+    for task in data["tasks"]:
         if "id" not in task or "cmd" not in task:
-            sys.exit(f"Every task needs an 'id' and a 'cmd': {task}")
-        if not TASK_ID_RE.match(task["id"]):
-            sys.exit(f"Task id {task['id']!r} may only contain letters, digits, '_' and '-'.")
+            raise QueueError(f"Every task needs an 'id' and a 'cmd': {task}")
+        if not valid_task_id(task["id"]):
+            raise QueueError(f"Task id {task['id']!r} may only contain letters, digits, '_' and '-'.")
         if task["id"] in seen:
-            sys.exit(f"Duplicate task id: {task['id']}")
+            raise QueueError(f"Duplicate task id: {task['id']}")
         seen.add(task["id"])
-    return settings, tasks
+    return settings, data["tasks"]
 
 
 def load_state():
@@ -108,14 +132,14 @@ def save_state(state):
 
 @contextmanager
 def state_lock(wait):
-    """Only one dispatcher may change state at a time. Timer and event runs that
-    overlap simply skip: the next run picks up whatever they would have done."""
+    """Only one mtdis process may change the queue or state at a time. Dispatch
+    passes that overlap simply skip: the next pass does whatever they would have."""
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(LOCK_FILE, "w") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError:
-            print("Another dispatcher run is in progress; skipping.")
+            print("Another mtdis run is in progress; skipping.")
             sys.exit(0)
         yield
 
@@ -124,11 +148,19 @@ def exit_file(task_id):
     return os.path.join(RUN_DIR, f"{task_id}.exit")
 
 
-def remove_exit_file(task_id):
-    try:
-        os.remove(exit_file(task_id))
-    except FileNotFoundError:
-        pass
+def log_file(task_id):
+    return os.path.join(LOG_DIR, f"{task_id}.log")
+
+
+def remove_run_files(task_id, all_files=False):
+    names = [f"{task_id}.exit"]
+    if all_files:
+        names += [f"{task_id}.sh", f"{task_id}.attach.command"]
+    for name in names:
+        try:
+            os.remove(os.path.join(RUN_DIR, name))
+        except FileNotFoundError:
+            pass
 
 
 def reqs_of(task):
@@ -240,29 +272,29 @@ def start_task(task, settings):
     os.makedirs(RUN_DIR, exist_ok=True)
     if session_alive(tid):  # e.g. a finished interactive task still waiting for Enter
         tmux("kill-session", "-t", f"={session_name(tid)}")
-    remove_exit_file(tid)
+    remove_run_files(tid)
 
     q = shlex.quote
-    log_file = os.path.join(LOG_DIR, f"{tid}.log")
-    cwd = os.path.expanduser(task.get("cwd", os.path.dirname(QUEUE_FILE)))
+    logpath = log_file(tid)
+    cwd = os.path.expanduser(task.get("cwd", "~"))
     interactive = task.get("open_terminal", False)
 
     lines = [
         "#!/bin/bash",
         f"cd {q(cwd)} || {{ echo 1 > {q(exit_file(tid))}; exit 1; }}",
-        f'echo "=== $(date) start {tid}" >> {q(log_file)}',
+        f'echo "=== $(date) start {tid}" >> {q(logpath)}',
     ]
     if interactive:
         # Output goes straight to the terminal so the program keeps a real TTY.
         lines += [task["cmd"], "code=$?"]
     else:
-        lines += [f"( {task['cmd']}\n) 2>&1 | tee -a {q(log_file)}", "code=${PIPESTATUS[0]}"]
+        lines += [f"( {task['cmd']}\n) 2>&1 | tee -a {q(logpath)}", "code=${PIPESTATUS[0]}"]
     lines += [
-        f'echo "=== $(date) exit $code" >> {q(log_file)}',
+        f'echo "=== $(date) exit $code" >> {q(logpath)}',
         f'echo "$code" > {q(exit_file(tid))}',
     ]
     if interactive:
-        lines += ['echo; echo "[mac-task-dispatcher] Task finished (exit $code). Press Enter to close."; read -r _']
+        lines += ['echo; echo "[mtdis] Task finished (exit $code). Press Enter to close."; read -r _']
 
     script = os.path.join(RUN_DIR, f"{tid}.sh")
     with open(script, "w") as f:
@@ -308,13 +340,13 @@ def stop_task(task_id, settings):
         except psutil.Error:
             pass
     tmux("kill-session", "-t", f"={session_name(task_id)}")
-    remove_exit_file(task_id)
+    remove_run_files(task_id)
 
 
-# ---------------------------------------------------------------- run
+# ---------------------------------------------------------------- dispatch
 
 def reconcile(tasks, recs):
-    """Record tasks that finished since the last run, and adopt orphaned sessions."""
+    """Record tasks that finished since the last pass, and adopt orphaned sessions."""
     now = time.time()
     for task in tasks:
         tid, rec = task["id"], recs[task["id"]]
@@ -342,17 +374,17 @@ def mark_stopped(rec, reason, cooldown_s=0):
     rec["cooldown_until"] = now + cooldown_s if cooldown_s else None
 
 
-def cmd_run(args):
-    settings, tasks = load_queue()
+def dispatch(internet=None, ac_power=None, reason="manual"):
     with state_lock(wait=False):
+        settings, tasks = load_queue()
         state = load_state()
         recs = state.setdefault("tasks", {})
         for task in tasks:
             recs.setdefault(task["id"], {"status": "pending", "runs": 0})
 
         env = {
-            "internet": detect_internet() if args.internet is None else args.internet,
-            "ac_power": detect_ac_power() if args.ac is None else args.ac,
+            "internet": detect_internet() if internet is None else internet,
+            "ac_power": detect_ac_power() if ac_power is None else ac_power,
         }
         gpu = has_metal_gpu(state)
         reconcile(tasks, recs)
@@ -361,12 +393,12 @@ def cmd_run(args):
         snap = Snapshot([t["id"] for t in running], settings["cpu_sample_s"])
         free_ram = snap.free_ram_gb
         cpu = snap.cpu_percent
-        log(f"[{args.reason}] internet={env['internet']} ac={env['ac_power']} gpu={gpu} "
+        log(f"[{reason}] internet={env['internet']} ac={env['ac_power']} gpu={gpu} "
             f"cpu={cpu:.0f}% free_ram={free_ram:.1f}GB running={len(running)}")
 
         def release(task):
-            running.remove(task)
             nonlocal free_ram, cpu
+            running.remove(task)
             free_ram += snap.task_ram_gb.get(task["id"], 0)
             cpu = max(0.0, cpu - snap.task_cpu.get(task["id"], 0))
 
@@ -436,110 +468,5 @@ def cmd_run(args):
             ram_headroom -= need_ram
             projected_cpu += reqs.get("expected_cpu_percent", 0)
 
+        state["last_run"] = {"at": time.time(), "reason": reason}
         save_state(state)
-
-
-# ---------------------------------------------------------------- other commands
-
-def cmd_status(args):
-    _, tasks = load_queue()
-    recs = load_state().get("tasks", {})
-    running_ids = [t["id"] for t in tasks if recs.get(t["id"], {}).get("status") == "running"]
-    snap = Snapshot(running_ids, 0.5)
-    print(f"CPU {snap.cpu_percent:.0f}% | free RAM {snap.free_ram_gb:.1f}GB | queue {QUEUE_FILE}\n")
-    print(f"{'TASK':<24}{'STATUS':<10}{'RUNS':>5}  {'CPU':>5}  {'RAM':>7}  {'STARTED':<12}{'EXIT':>5}  NOTE")
-    for task in tasks:
-        tid = task["id"]
-        rec = recs.get(tid, {"status": "pending", "runs": 0})
-        status = rec["status"]
-        live = status == "running"
-        cpu = f"{snap.task_cpu.get(tid, 0):.0f}%" if live else "-"
-        ram = f"{snap.task_ram_gb.get(tid, 0):.2f}G" if live else "-"
-        code = rec.get("exit_code")
-        note = ""
-        if status == "pending":
-            note = "waiting: " + rec["waiting_for"] if rec.get("waiting_for") else "waiting for next run"
-            if rec.get("last_stop"):
-                note += f" (last stopped: {rec['last_stop']['reason']})"
-        elif status == "held":
-            note = "held by `stop`; `reset` to release"
-        elif status in ("done", "failed"):
-            note = f"finished {fmt_time(rec.get('finished_at'))}"
-        print(f"{tid:<24}{status:<10}{rec.get('runs', 0):>5}  {cpu:>5}  {ram:>7}  "
-              f"{fmt_time(rec.get('started_at')):<12}{'-' if code is None else code:>5}  {note}")
-
-
-def cmd_stop(args):
-    settings, tasks = load_queue()
-    ids = {t["id"] for t in tasks}
-    with state_lock(wait=True):
-        state = load_state()
-        recs = state.setdefault("tasks", {})
-        for tid in args.ids:
-            if tid not in ids:
-                print(f"Unknown task: {tid}")
-                continue
-            stop_task(tid, settings)
-            rec = recs.setdefault(tid, {"runs": 0})
-            rec.update(status="held", last_stop={"at": time.time(), "reason": "stopped by user"})
-            print(f"Stopped {tid}. It won't start again until you run: dispatcher.py reset {tid}")
-        save_state(state)
-
-
-def cmd_reset(args):
-    _, tasks = load_queue()
-    with state_lock(wait=True):
-        state = load_state()
-        recs = state.setdefault("tasks", {})
-        ids = [t["id"] for t in tasks] if args.all else args.ids
-        if not ids:
-            sys.exit("Name one or more task ids, or pass --all.")
-        for tid in ids:
-            rec = recs.get(tid)
-            if rec is None:
-                continue
-            if rec["status"] == "running":
-                if not args.all:
-                    print(f"{tid} is running; stop it first.")
-                continue
-            remove_exit_file(tid)
-            recs[tid] = {"status": "pending", "runs": rec.get("runs", 0)}
-            print(f"{tid}: pending")
-        save_state(state)
-
-
-def parse_bool(value):
-    if value.lower() in ("true", "1", "yes"):
-        return True
-    if value.lower() in ("false", "0", "no"):
-        return False
-    raise argparse.ArgumentTypeError("expected true or false")
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    run = sub.add_parser("run", help="check conditions; start, stop and record tasks")
-    run.add_argument("--internet", type=parse_bool, help="true/false (detected if omitted)")
-    run.add_argument("--ac", type=parse_bool, help="true/false (detected if omitted)")
-    run.add_argument("--reason", default="manual", help="label for the log, e.g. wake or timer")
-    run.set_defaults(func=cmd_run)
-
-    sub.add_parser("status", help="show every task and its live CPU/RAM").set_defaults(func=cmd_status)
-
-    stop = sub.add_parser("stop", help="stop tasks and hold them until reset")
-    stop.add_argument("ids", nargs="+")
-    stop.set_defaults(func=cmd_stop)
-
-    reset = sub.add_parser("reset", help="put done, failed or held tasks back in the queue")
-    reset.add_argument("ids", nargs="*")
-    reset.add_argument("--all", action="store_true", help="reset every task that isn't running")
-    reset.set_defaults(func=cmd_reset)
-
-    args = parser.parse_args()
-    args.func(args)
-
-
-if __name__ == "__main__":
-    main()

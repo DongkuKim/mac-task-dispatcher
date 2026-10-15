@@ -1,10 +1,11 @@
--- mac-task-dispatcher: Hammerspoon side.
+-- mtdis: Hammerspoon side.
 -- Watches network, power and wake events (plus a periodic timer) and runs
--- `dispatcher.py run` with the current state. Usage in ~/.hammerspoon/init.lua:
+-- `mtdis run` with the current state. `mtdis setup` adds this to
+-- ~/.hammerspoon/init.lua:
 --
---   require("mac_task_dispatcher").start({ repo = "/path/to/mac-task-dispatcher" })
+--   require("mtdis").start({ command = "/opt/homebrew/bin/mtdis" })
 --
--- Options: repo (required), python (default <repo>/.venv/bin/python),
+-- Options: command (path to mtdis, default /opt/homebrew/bin/mtdis),
 --          interval (seconds between timer runs, default 60; 0 disables the timer).
 
 local M = {}
@@ -22,9 +23,8 @@ local function isReachable(flags)
 end
 
 function M.start(opts)
-    assert(opts and opts.repo, "mac_task_dispatcher.start needs { repo = <path> }")
-    local python = opts.python or (opts.repo .. "/.venv/bin/python")
-    local script = opts.repo .. "/dispatcher.py"
+    opts = opts or {}
+    local command = opts.command or "/opt/homebrew/bin/mtdis"
     local interval = opts.interval or 60
 
     local reach = hs.network.reachability.internet()
@@ -39,9 +39,9 @@ function M.start(opts)
             rerun = reason
             return
         end
-        current = hs.task.new(python, function(code, stdout, stderr)
+        current = hs.task.new(command, function(code, stdout, stderr)
             if code ~= 0 then
-                print("mac-task-dispatcher failed (" .. code .. "): " .. stderr)
+                print("mtdis failed (" .. code .. "): " .. stderr)
             end
             current = nil
             if rerun then
@@ -49,7 +49,7 @@ function M.start(opts)
                 rerun = nil
                 dispatch(r)
             end
-        end, { script, "run",
+        end, { "run",
                "--internet", tostring(state.internet),
                "--ac", tostring(state.ac),
                "--reason", reason })

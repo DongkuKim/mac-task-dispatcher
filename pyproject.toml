@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtdis"
+dynamic = ["version"]
+description = "Run background tasks on your Mac only when internet, power, CPU, RAM and GPU allow."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = ["psutil>=5.9"]
+
+[project.urls]
+Homepage = "https://github.com/DongkuKim/mac-task-dispatcher"
+
+[project.scripts]
+mtdis = "mtdis.cli:main"
+
+[tool.setuptools]
+packages = ["mtdis"]
+
+[tool.setuptools.package-data]
+mtdis = ["mtdis.lua"]
+
+[tool.setuptools.dynamic]
+version = { attr = "mtdis.__version__" }

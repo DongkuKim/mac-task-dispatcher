@@ -1,0 +1,41 @@
+{
+  "settings": {
+    "max_parallel": 3,
+    "reserve_ram_gb": 2.0,
+    "restart_cooldown_s": 300
+  },
+  "tasks": [
+    {
+      "id": "photo_backup",
+      "cmd": "rsync -a ~/Pictures/ /Volumes/Backup/Pictures/",
+      "requirements": {
+        "needs_ac_power": true,
+        "min_ram_gb": 0.5,
+        "max_cpu_percent": 70
+      }
+    },
+    {
+      "id": "api_scraper",
+      "cmd": "python3 scraper.py",
+      "cwd": "~/projects/scraper",
+      "requirements": {
+        "needs_internet": true,
+        "min_ram_gb": 1.0,
+        "max_cpu_percent": 90,
+        "expected_cpu_percent": 10
+      }
+    },
+    {
+      "id": "local_llm_chat",
+      "cmd": "ollama run llama3",
+      "open_terminal": true,
+      "requirements": {
+        "needs_ac_power": true,
+        "needs_gpu": true,
+        "min_ram_gb": 8.0,
+        "max_cpu_percent": 60,
+        "expected_cpu_percent": 30
+      }
+    }
+  ]
+}

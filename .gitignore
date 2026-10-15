@@ -1,0 +1,5 @@
+.venv/
+state/
+queue.json
+__pycache__/
+.DS_Store

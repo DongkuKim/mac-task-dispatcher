@@ -16,8 +16,9 @@ python3 -m venv "$REPO/.venv"
 "$REPO/.venv/bin/pip" install --quiet -r "$REPO/requirements.txt"
 
 if [ ! -f "$REPO/queue.json" ]; then
-    cp "$REPO/queue.example.json" "$REPO/queue.json"
-    echo "Created queue.json from the example. Edit it to add your own tasks."
+    # Start empty: the example tasks would run for real as soon as Hammerspoon loads.
+    printf '{\n  "settings": {},\n  "tasks": []\n}\n' > "$REPO/queue.json"
+    echo "Created an empty queue.json. Add tasks to it (see queue.example.json)."
 fi
 
 mkdir -p "$HS_DIR"

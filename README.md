@@ -49,7 +49,7 @@ cd mac-task-dispatcher && ./install.sh
 `install.sh`:
 
 1. creates `.venv` and installs `psutil` into it,
-2. copies `queue.example.json` to `queue.json` (if you don't have one yet),
+2. creates an empty `queue.json` if you don't have one yet (`queue.example.json` shows the format),
 3. links `hammerspoon/mac_task_dispatcher.lua` into `~/.hammerspoon/`,
 4. adds this line to `~/.hammerspoon/init.lua`:
 

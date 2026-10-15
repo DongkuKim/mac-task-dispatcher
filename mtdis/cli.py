@@ -24,8 +24,16 @@ LEGACY_MARKERS = ('require("mac_task_dispatcher")', "-- mac-task-dispatcher")
 
 def cmd_status(args):
     _, tasks = d.load_queue()
-    state = d.load_state()
-    recs = state.get("tasks", {})
+    # Record tasks that finished since the last check, so they don't show as
+    # running until the next one. Skipped if a dispatch pass holds the lock.
+    with d.state_lock(wait=False, exit_if_busy=False) as locked:
+        state = d.load_state()
+        recs = state.setdefault("tasks", {})
+        if locked:
+            for task in tasks:
+                recs.setdefault(task["id"], {"status": "pending", "runs": 0})
+            if d.reconcile(tasks, recs, echo=False):
+                d.save_state(state)
     running_ids = [t["id"] for t in tasks if recs.get(t["id"], {}).get("status") == "running"]
     snap = d.Snapshot(running_ids, 0.5)
 

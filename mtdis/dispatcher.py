@@ -54,9 +54,10 @@ class QueueError(Exception):
 
 # ---------------------------------------------------------------- helpers
 
-def log(msg):
+def log(msg, echo=True):
     line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
-    print(line, flush=True)
+    if echo:
+        print(line, flush=True)
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(DISPATCH_LOG, "a") as f:
@@ -131,17 +132,21 @@ def save_state(state):
 
 
 @contextmanager
-def state_lock(wait):
+def state_lock(wait, exit_if_busy=True):
     """Only one mtdis process may change the queue or state at a time. Dispatch
-    passes that overlap simply skip: the next pass does whatever they would have."""
+    passes that overlap simply skip: the next pass does whatever they would have.
+    With exit_if_busy=False, yields whether the lock was taken instead of exiting."""
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(LOCK_FILE, "w") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError:
-            print("Another mtdis run is in progress; skipping.")
-            sys.exit(0)
-        yield
+            if exit_if_busy:
+                print("Another mtdis run is in progress; skipping.")
+                sys.exit(0)
+            yield False
+            return
+        yield True
 
 
 def exit_file(task_id):
@@ -345,8 +350,10 @@ def stop_task(task_id, settings):
 
 # ---------------------------------------------------------------- dispatch
 
-def reconcile(tasks, recs):
-    """Record tasks that finished since the last pass, and adopt orphaned sessions."""
+def reconcile(tasks, recs, echo=True):
+    """Record tasks that finished since the last pass, and adopt orphaned sessions.
+    Returns whether anything changed."""
+    changed = False
     now = time.time()
     for task in tasks:
         tid, rec = task["id"], recs[task["id"]]
@@ -358,14 +365,19 @@ def reconcile(tasks, recs):
                         code = int(f.read().strip())
                 except ValueError:
                     code = None
-                rec.update(status="done" if code == 0 else "failed", exit_code=code, finished_at=now)
-                log(f"  {tid} finished: {rec['status']} (exit {code})")
+                finished = os.path.getmtime(exit_file(tid))
+                rec.update(status="done" if code == 0 else "failed", exit_code=code, finished_at=finished)
+                log(f"  {tid} finished: {rec['status']} (exit {code})", echo)
+                changed = True
             elif not session_alive(tid):
                 rec.update(status="failed", exit_code=None, finished_at=now)
-                log(f"  {tid} disappeared without an exit code: marked failed")
+                log(f"  {tid} disappeared without an exit code: marked failed", echo)
+                changed = True
         elif rec["status"] == "pending" and not has_exit and session_alive(tid):
             rec.update(status="running", started_at=rec.get("started_at") or now)
-            log(f"  {tid} found running in tmux: adopted")
+            log(f"  {tid} found running in tmux: adopted", echo)
+            changed = True
+    return changed
 
 
 def mark_stopped(rec, reason, cooldown_s=0):
